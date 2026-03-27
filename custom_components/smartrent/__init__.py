@@ -18,6 +18,7 @@ from smartrent.utils import InvalidAuthError
 
 from .const import (
     CONF_PASSWORD,
+    CONF_REFRESH_TOKEN,
     CONF_TOKEN,
     CONF_USERNAME,
     DOMAIN,
@@ -37,16 +38,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     username = entry.data.get(CONF_USERNAME)
     password = entry.data.get(CONF_PASSWORD)
     tfa_token = entry.data.get(CONF_TOKEN)
+    stored_refresh_token = entry.data.get(CONF_REFRESH_TOKEN)
 
     session = async_get_clientsession(hass)
     try:
-        api = await async_login(username, password, session, tfa_token=tfa_token)
+        if stored_refresh_token:
+            try:
+                api = API(username, password, session)
+                api.client._refresh_token = stored_refresh_token
+                await api.async_fetch_devices()
+                _LOGGER.info("Rehydrated auth using stored refresh token")
+            except InvalidAuthError:
+                _LOGGER.warning(
+                    "Stored refresh token rejected. Falling back to full login."
+                )
+                api = await async_login(username, password, session, tfa_token=tfa_token)
+        else:
+            api = await async_login(username, password, session, tfa_token=tfa_token)
     except InvalidAuthError as exception:
         raise ConfigEntryAuthFailed("Credentials expired!") from exception
     except ClientConnectorError as exception:
         raise ConfigEntryNotReady from exception
     except EOFError as exception:
         raise ConfigEntryAuthFailed("TFA not supplied. Please Reauth!") from exception
+
+    new_refresh_token = api.client._refresh_token
+    if new_refresh_token and new_refresh_token != stored_refresh_token:
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_REFRESH_TOKEN: new_refresh_token}
+        )
 
     hass.data[DOMAIN][entry.entry_id] = api
 
@@ -69,6 +89,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     api: API = hass.data[DOMAIN][entry.entry_id]
     for device in api.get_device_list():
         device.stop_updater()
+
+    latest_refresh_token = api.client._refresh_token
+    if latest_refresh_token and latest_refresh_token != entry.data.get(CONF_REFRESH_TOKEN):
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_REFRESH_TOKEN: latest_refresh_token}
+        )
 
     if unloaded:
         hass.data[DOMAIN].pop(entry.entry_id)
