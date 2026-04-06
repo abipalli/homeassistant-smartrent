@@ -29,6 +29,32 @@ from .const import (
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
 
+def _install_token_persist_hook(
+    hass: HomeAssistant, entry: ConfigEntry, api: API
+) -> None:
+    """Wrap the client's token refresh so every rotation is persisted immediately.
+
+    The smartrent-py library rotates the refresh token on every call to
+    ``_async_refresh_token`` (WebSocket reconnects, retries, etc.).  The old
+    token is invalidated server-side, so we must persist the new one right away
+    — waiting for ``async_unload_entry`` is not sufficient because a crash or
+    power-off would leave a stale (invalidated) token on disk.
+    """
+    client = api.client
+    original_refresh = client._async_refresh_token
+
+    async def _persist_after_refresh() -> None:
+        await original_refresh()
+        new_token = client._refresh_token
+        if new_token and new_token != entry.data.get(CONF_REFRESH_TOKEN):
+            hass.config_entries.async_update_entry(
+                entry, data={**entry.data, CONF_REFRESH_TOKEN: new_token}
+            )
+            _LOGGER.debug("Persisted rotated refresh token")
+
+    client._async_refresh_token = _persist_after_refresh
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up this integration using UI."""
     if hass.data.get(DOMAIN) is None:
@@ -44,11 +70,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     try:
         if stored_refresh_token:
             try:
-                api = API(username, password, session)
+                api = API(username, password, session, tfa_token=tfa_token)
                 api.client._refresh_token = stored_refresh_token
                 await api.async_fetch_devices()
                 _LOGGER.info("Rehydrated auth using stored refresh token")
-            except InvalidAuthError:
+            except (InvalidAuthError, KeyError):
                 _LOGGER.warning(
                     "Stored refresh token rejected. Falling back to full login."
                 )
@@ -62,11 +88,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     except EOFError as exception:
         raise ConfigEntryAuthFailed("TFA not supplied. Please Reauth!") from exception
 
-    new_refresh_token = api.client._refresh_token
-    if new_refresh_token and new_refresh_token != stored_refresh_token:
-        hass.config_entries.async_update_entry(
-            entry, data={**entry.data, CONF_REFRESH_TOKEN: new_refresh_token}
-        )
+    _install_token_persist_hook(hass, entry, api)
 
     hass.data[DOMAIN][entry.entry_id] = api
 
@@ -89,12 +111,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     api: API = hass.data[DOMAIN][entry.entry_id]
     for device in api.get_device_list():
         device.stop_updater()
-
-    latest_refresh_token = api.client._refresh_token
-    if latest_refresh_token and latest_refresh_token != entry.data.get(CONF_REFRESH_TOKEN):
-        hass.config_entries.async_update_entry(
-            entry, data={**entry.data, CONF_REFRESH_TOKEN: latest_refresh_token}
-        )
 
     if unloaded:
         hass.data[DOMAIN].pop(entry.entry_id)
